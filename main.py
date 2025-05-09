@@ -3,7 +3,7 @@ import win32clipboard
 import time
 import pywintypes
 from time import sleep
-from optimisewait import set_autopath, set_altpath
+from optimisewait import set_autopath, set_altpath # Assuming this exists
 import logging
 import json
 from typing import Union, List, Dict, Optional
@@ -187,26 +187,32 @@ class SelectiveConsolePrintHandler(logging.Handler):
         try:
             thinking_match = re.search(r"<thinking>(.*?)</thinking>", response_text, re.DOTALL)
             if thinking_match: thinking_content = thinking_match.group(1).strip()
+            
             attempt_completion_match = re.search(r"<attempt_completion>(.*?)</attempt_completion>", response_text, re.DOTALL)
             if attempt_completion_match:
                 result_tag_match = re.search(r"<result>(.*?)</result>", attempt_completion_match.group(1), re.DOTALL)
                 if result_tag_match: result_content = result_tag_match.group(1).strip()
+            
             ask_followup_match = re.search(r"<ask_followup_question>(.*?)</ask_followup_question>", response_text, re.DOTALL)
             if ask_followup_match: ask_followup_raw_content = ask_followup_match.group(1).strip()
         except Exception as e:
             logger.error(f"SelectiveConsolePrintHandler: Regex parsing error: {e}", exc_info=True)
 
         console_output_blocks, speech_parts_to_say = [], []
+        
         if thinking_content:
             console_output_blocks.append(thinking_content)
-            speech_parts_to_say.append(thinking_content)
+            # speech_parts_to_say.append(thinking_content) # MODIFIED: Do not speak thinking content
+
         if result_content:
             console_output_blocks.append(f"Attempt Completion, {result_content}")
-            speech_parts_to_say.append(f"Attempt Completion. {result_content}")
+            speech_parts_to_say.append(f"Attempt Completion. {result_content}") # Speak attempt completion
+
         if ask_followup_raw_content:
             question_text_parsed, options_list_str_parsed = "", ""
             question_text_match = re.search(r"<question>(.*?)</question>", ask_followup_raw_content, re.DOTALL)
             if question_text_match: question_text_parsed = question_text_match.group(1).strip()
+            
             options_text_match = re.search(r"<options>(.*?)</options>", ask_followup_raw_content, re.DOTALL)
             if options_text_match:
                 raw_options_str = options_text_match.group(1).strip()
@@ -222,22 +228,23 @@ class SelectiveConsolePrintHandler(logging.Handler):
             followup_console_parts = []
             if question_text_parsed:
                 followup_console_parts.append(question_text_parsed)
-                speech_parts_to_say.append(f"I have a question: {question_text_parsed}")
+                speech_parts_to_say.append(f"I have a question: {question_text_parsed}") # Speak question
             if options_list_str_parsed:
                 followup_console_parts.append(options_list_str_parsed)
-                speech_parts_to_say.append(f"Your options are: {options_list_str_parsed}")
+                speech_parts_to_say.append(f"Your options are: {options_list_str_parsed}") # Speak options
             if followup_console_parts:
                 console_output_blocks.append("\n".join(followup_console_parts))
 
         if console_output_blocks:
-            sys.stdout.write("\n\n".join(filter(None, console_output_blocks)) + "\n")
+            sys.stdout.write("\n\n" + "\n\n".join(filter(None, console_output_blocks)) + "\n")
             sys.stdout.flush()
+            
         if speech_parts_to_say:
             full_speech_output = ". ".join(filter(None, speech_parts_to_say)).strip()
             if full_speech_output:
-                speak_via_queue(full_speech_output) # MODIFIED HERE
+                speak_via_queue(full_speech_output)
             else:
-                logger.debug("SelectiveConsolePrintHandler: full_speech_output empty.")
+                logger.debug("SelectiveConsolePrintHandler: full_speech_output empty after filtering.")
         else:
             logger.debug("SelectiveConsolePrintHandler: speech_parts_to_say empty.")
 
@@ -254,11 +261,16 @@ except Exception as e: logger.warning(f"Werkzeug logger config error: {e}")
 app = Flask(__name__)
 last_request_time = 0
 MIN_REQUEST_INTERVAL = 5 
-set_autopath(r"D:\cline-x-claudeweb\images")
-set_altpath(r"D:\cline-x-claudeweb\images\alt1440")
+# Ensure optimisewait paths are correctly set if the module is used.
+# If not, these lines might need adjustment or removal depending on your setup.
+try:
+    set_autopath(r"D:\cline-x-claudeweb\images")
+    set_altpath(r"D:\cline-x-claudeweb\images\alt1440")
+except NameError:
+    logger.warning("optimisewait functions (set_autopath, set_altpath) not defined. Skipping.")
+
 
 # --- Clipboard, Content Extraction, LLM Interaction, Flask Routes (Largely Unchanged) ---
-# (Ensure they use logger correctly if needed, but their core logic for TTS is now via speak_via_queue)
 
 def set_clipboard(text, retries=3, delay=0.2):
     for i in range(retries):
@@ -352,7 +364,8 @@ def handle_llm_interaction(prompt_text: str, request_json_data: Dict):
     llm_response_raw = talkto("gemini", full_prompt, image_list)
     
     if isinstance(llm_response_raw, str):
-        logger.info(f"{selective_handler.llm_response_marker} {llm_response_raw}")
+        # This log message is what SelectiveConsolePrintHandler picks up
+        logger.info(f"{selective_handler.llm_response_marker} {llm_response_raw}") 
     else:
         logger.warning(f"LLM response not str: {type(llm_response_raw)}. Content: {str(llm_response_raw)[:100]}.")
         return ""
@@ -422,7 +435,9 @@ if __name__ == '__main__':
     logger.info(f"Main: Starting API Bridge server on port 3001. TTS Worker Initialized Flag: {tts_engine_initialized_in_worker}")
     
     try:
-        app.run(host="0.0.0.0", port=3001, debug=False, use_reloader=False)
+        # Ensure Flask runs without the reloader if debug=True, as it can cause issues with threads
+        # For production or stable testing, debug=False and use_reloader=False is good.
+        app.run(host="0.0.0.0", port=3001, debug=False, use_reloader=False) 
     finally:
         logger.info("Main: Application shutting down...")
         stop_tts_service() # Request TTS worker to stop and join
