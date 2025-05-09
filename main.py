@@ -25,21 +25,15 @@ from threading import Thread, Lock
 
 tts_engine = None
 tts_initialized_successfully = False
-tts_lock = Lock()  # To serialize access to the TTS engine
+tts_lock = Lock()
 
 def init_tts():
     global tts_engine, tts_initialized_successfully
-    if tts_engine is not None: # Already initialized
+    if tts_engine is not None:
         return
     try:
         logger.info("Initializing TTS engine...")
         tts_engine = pyttsx3.init()
-        # Optional: Adjust TTS properties
-        # tts_engine.setProperty('rate', 150)  # Speed of speech (words per minute)
-        # tts_engine.setProperty('volume', 0.9) # Volume (0.0 to 1.0)
-        # voices = tts_engine.getProperty('voices')
-        # if voices:
-        #     tts_engine.setProperty('voice', voices[0].id) # Example: Set to the first available voice
         tts_initialized_successfully = True
         logger.info("TTS engine initialized successfully.")
     except Exception as e:
@@ -53,16 +47,14 @@ def speak_threaded(text_to_say: str):
         return
 
     text_to_say_cleaned = str(text_to_say).strip()
-    if not text_to_say_cleaned: # Don't speak empty strings
+    if not text_to_say_cleaned:
         return
 
     def target():
         try:
-            with tts_lock: # Ensure only one thread uses the engine at a time
-                # logger.debug(f"TTS Thread: Saying: '{text_to_say_cleaned[:50]}...'")
+            with tts_lock:
                 tts_engine.say(text_to_say_cleaned)
-                tts_engine.runAndWait() # Blocks this worker thread until speech is done
-                # logger.debug("TTS Thread: Finished speaking.")
+                tts_engine.runAndWait()
         except RuntimeError as e:
             if "run loop already started" in str(e).lower():
                 logger.warning(f"TTS run loop conflict for text '{text_to_say_cleaned[:30]}...'. Speech might be skipped.")
@@ -71,7 +63,6 @@ def speak_threaded(text_to_say: str):
         except Exception as e:
             logger.error(f"TTS error in thread for text '{text_to_say_cleaned[:30]}...': {e}", exc_info=True)
 
-    # Start speech in a new daemon thread to avoid blocking the main application
     thread = Thread(target=target)
     thread.daemon = True
     thread.start()
@@ -96,8 +87,6 @@ class SelectiveConsolePrintHandler(logging.Handler):
         result_content = None
         ask_followup_raw_content = None
         
-        printed_anything_to_console = False
-
         try:
             thinking_match = re.search(r"<thinking>(.*?)</thinking>", response_text, re.DOTALL)
             if thinking_match:
@@ -112,83 +101,83 @@ class SelectiveConsolePrintHandler(logging.Handler):
             ask_followup_match = re.search(r"<ask_followup_question>(.*?)</ask_followup_question>", response_text, re.DOTALL)
             if ask_followup_match:
                 ask_followup_raw_content = ask_followup_match.group(1).strip()
-
         except Exception:
+            # Silently ignore regex errors for console cleanliness
             pass 
 
+        # --- Prepare console and speech outputs ---
+        console_output_blocks = [] # Each item will be a block of text for console
+        speech_parts_to_say = []   # Each item is a phrase for speech
+
         if thinking_content:
-            print_output = "Thinking,\n" + thinking_content + "\n"
-            sys.stdout.write(print_output)
-            speak_threaded("Thinking. " + thinking_content)
-            printed_anything_to_console = True
+            console_output_blocks.append(thinking_content) # No "Thinking," prefix for console
+            speech_parts_to_say.append(thinking_content)   # Speech will just be the thought
 
         if result_content:
-            if printed_anything_to_console: # Printed "Thinking" block before
-                sys.stdout.write("\n") # Visual separator for console
-            
-            print_output = f"Attempt Completion, {result_content}\n"
-            sys.stdout.write(print_output)
-            speak_threaded(f"Attempt Completion. {result_content}")
-            printed_anything_to_console = True
-        
-        if ask_followup_raw_content:
-            if printed_anything_to_console: # Printed "Thinking" or "Attempt" block before
-                sys.stdout.write("\n") # Visual separator
+            console_output_blocks.append(f"Attempt Completion, {result_content}") # Keep prefix for console
+            speech_parts_to_say.append(f"Attempt Completion. {result_content}")    # Prefix for speech clarity
 
-            question_text = ""
-            options_list_str = ""
+        if ask_followup_raw_content:
+            question_text_parsed = ""
+            options_list_str_parsed = "" # For both console and speech, format may differ slightly
             
             question_text_match = re.search(r"<question>(.*?)</question>", ask_followup_raw_content, re.DOTALL)
             if question_text_match:
-                question_text = question_text_match.group(1).strip()
+                question_text_parsed = question_text_match.group(1).strip()
             
             options_text_match = re.search(r"<options>(.*?)</options>", ask_followup_raw_content, re.DOTALL)
             if options_text_match:
                 raw_options_str = options_text_match.group(1).strip()
                 try:
-                    options_parsed = json.loads(raw_options_str)
-                    if isinstance(options_parsed, list):
-                        options_list_str = ", ".join(str(opt) for opt in options_parsed)
+                    options_parsed_json = json.loads(raw_options_str)
+                    if isinstance(options_parsed_json, list):
+                        options_list_str_parsed = ", ".join(str(opt) for opt in options_parsed_json)
                 except json.JSONDecodeError:
                     cleaned_options_val = raw_options_str
                     if cleaned_options_val.startswith('[') and cleaned_options_val.endswith(']'):
                         cleaned_options_val = cleaned_options_val[1:-1]
                     parts = [opt.strip().strip('"').strip("'") for opt in cleaned_options_val.split(',')]
-                    options_list_str = ", ".join(p for p in parts if p)
+                    options_list_str_parsed = ", ".join(p for p in parts if p)
                 except Exception:
-                    options_list_str = ""
+                    options_list_str_parsed = "" # Default to empty if complex error
 
-            followup_block_printed_content = False
-            speech_parts_followup = []
-
-            if question_text:
-                sys.stdout.write(f"I have question, {question_text}\n")
-                speech_parts_followup.append(f"I have a question: {question_text}")
-                followup_block_printed_content = True
+            followup_console_block_parts = []
+            if question_text_parsed:
+                followup_console_block_parts.append(question_text_parsed) # No "I have question," for console
+                speech_parts_to_say.append(f"I have a question: {question_text_parsed}") # Prefix for speech
             
-            if options_list_str:
-                sys.stdout.write(options_list_str + "\n")
-                speech_parts_followup.append(f"Your options are: {options_list_str}")
-                followup_block_printed_content = True
+            if options_list_str_parsed:
+                followup_console_block_parts.append(options_list_str_parsed)
+                speech_parts_to_say.append(f"Your options are: {options_list_str_parsed}") # Prefix for speech
             
-            if speech_parts_followup:
-                speak_threaded(". ".join(speech_parts_followup))
+            if followup_console_block_parts:
+                # Join question and options with a newline for console if both exist
+                console_output_blocks.append("\n".join(followup_console_block_parts))
 
-            if followup_block_printed_content:
-                printed_anything_to_console = True
+        # --- Print to console ---
+        if console_output_blocks:
+            # Join the main blocks (thinking, attempt, followup_block) with a blank line
+            full_console_output = "\n\n".join(filter(None, console_output_blocks))
+            if full_console_output: # Ensure not printing just newlines if all blocks were empty somehow
+                sys.stdout.write(full_console_output + "\n")
+                sys.stdout.flush()
 
-        if printed_anything_to_console:
-            sys.stdout.flush()
+        # --- Speak the combined message ---
+        if speech_parts_to_say:
+            # Join speech parts with ". " for a slight pause and natural flow
+            full_speech_output = ". ".join(filter(None, speech_parts_to_say))
+            if full_speech_output: # Ensure not trying to speak an empty string
+                speak_threaded(full_speech_output)
+
 
 # --- Standard Logging Setup ---
-# (No changes here, but ensure logger is available for TTS functions)
 logging.basicConfig(
     level=logging.DEBUG, 
     format='%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S',
     handlers=[] 
 )
-logger = logging.getLogger(__name__) # Make sure logger is defined before init_tts if it uses it
+logger = logging.getLogger(__name__)
 
 root_logger = logging.getLogger()
 for handler in root_logger.handlers[:]:
@@ -196,11 +185,10 @@ for handler in root_logger.handlers[:]:
         root_logger.removeHandler(handler)
 
 selective_handler = SelectiveConsolePrintHandler()
-selective_handler.setFormatter(logging.Formatter('%(message)s'))
+selective_handler.setFormatter(logging.Formatter('%(message)s')) 
 selective_handler.setLevel(logging.INFO) 
 root_logger.addHandler(selective_handler)
 
-# Optional FileHandler (as before)
 # file_handler = logging.FileHandler("app_full.log", mode='w') 
 # file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s'))
 # file_handler.setLevel(logging.DEBUG)
@@ -217,13 +205,12 @@ except Exception as e:
 # --- Flask App and Globals ---
 app = Flask(__name__)
 last_request_time = 0
-MIN_REQUEST_INTERVAL = 5 # seconds
+MIN_REQUEST_INTERVAL = 5 
 
 set_autopath(r"D:\cline-x-claudeweb\images")
 set_altpath(r"D:\cline-x-claudeweb\images\alt1440")
 
-# --- Clipboard Functions ---
-# (No changes needed in clipboard functions)
+# --- Clipboard Functions (Unchanged from previous version) ---
 def set_clipboard(text, retries=3, delay=0.2):
     for i in range(retries):
         try:
@@ -268,8 +255,7 @@ def set_clipboard_image(image_data):
         logger.error(f"Error setting image to clipboard: {e}", exc_info=True)
         return False
 
-# --- Content Extraction ---
-# (No changes needed in get_content_text)
+# --- Content Extraction (Unchanged from previous version) ---
 def get_content_text(content: Union[str, List[Dict[str, str]], Dict[str, str]]) -> str:
     if isinstance(content, str):
         return content
@@ -320,9 +306,7 @@ def get_content_text(content: Union[str, List[Dict[str, str]], Dict[str, str]]) 
         return text_content 
     return ""
 
-
-# --- Core LLM Interaction Logic ---
-# (No changes needed in handle_llm_interaction, as SelectiveConsolePrintHandler handles the speaking)
+# --- Core LLM Interaction Logic (Unchanged from previous version) ---
 def handle_llm_interaction(prompt_text: str, request_json_data: Dict):
     global last_request_time
     logger.info(f"Starting LLM interaction. User prompt (first 200 chars): {prompt_text[:200]}...")
@@ -411,8 +395,7 @@ def handle_llm_interaction(prompt_text: str, request_json_data: Dict):
     else:
         return ""
 
-# --- Flask Routes ---
-# (No changes needed in Flask routes)
+# --- Flask Routes (Unchanged from previous version) ---
 @app.route('/', methods=['GET'])
 def home():
     logger.info(f"GET request to / from {request.remote_addr}")
@@ -493,24 +476,18 @@ def chat_completions():
         logger.error(f"Critical error in /chat/completions: {str(e)}", exc_info=True)
         return jsonify({'error': {'message': f"An internal server error occurred: {str(e)}"}}), 500
 
-# --- Main Execution ---
+# --- Main Execution (Unchanged from previous version) ---
 if __name__ == '__main__':
-    # Initialize TTS engine first
-    # Note: logger must be configured before init_tts() is called if init_tts() uses logging.
-    # In this setup, basicConfig then defining logger then calling init_tts is fine.
     init_tts() 
 
     startup_message = "Cline x voice running"
     sys.stdout.write(startup_message + "\n")
     sys.stdout.flush() 
-    speak_threaded(startup_message) # Speak the startup message
+    speak_threaded(startup_message) 
     
     logger.info(f"Starting API Bridge server on port 3001. TTS Initialized: {tts_initialized_successfully}")
     
     try:
         app.run(host="0.0.0.0", port=3001, debug=False)
     finally:
-        # Optional: Clean up TTS engine if needed, though daemon threads usually don't require explicit shutdown.
-        # if tts_engine and hasattr(tts_engine, 'stop'):
-        # tts_engine.stop() # pyttsx3 doesn't always have a clean stop, runAndWait handles loop.
         logger.info("Application shutting down.")
