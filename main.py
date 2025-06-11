@@ -1,9 +1,9 @@
 from flask import Flask, jsonify, request, Response
-import win32clipboard
+import win32clipboard # Assuming this is for Windows clipboard operations
 import time
-import pywintypes
+import pywintypes # For win32clipboard errors
 from time import sleep
-from optimisewait import set_autopath, set_altpath # Assuming this exists
+# from optimisewait import set_autopath, set_altpath # Assuming this exists
 import logging
 import json
 from typing import Union, List, Dict, Optional
@@ -17,15 +17,21 @@ import sys
 
 # --- TTS Imports and Setup (New Pattern) ---
 import pyttsx3
-from threading import Thread, Event
-import queue # For inter-thread communication
-# import atexit # Could be used for a more robust shutdown hook
+from threading import Thread, Event, Lock 
+import queue 
 
 # --- Global TTS Variables (New Pattern) ---
 tts_speech_queue = queue.Queue()
 tts_worker_stop_event = Event()
-tts_worker_thread_obj = None # To hold the Thread object
-tts_engine_initialized_in_worker = False # Flag to check if worker has successfully initialized TTS
+tts_worker_thread_obj = None
+tts_engine_initialized_in_worker = False
+
+# --- Global State for Readiness ---
+llm_interaction_lock = Lock()
+is_processing_llm_request = False
+# Status for /status endpoint: "IDLE", "PROCESSING", "AWAITING_FOLLOWUP", "COMPLETED_NO_FOLLOWUP", "ERROR"
+current_system_status = "IDLE" 
+system_status_message = "System initializing..." # For /status endpoint
 
 # --- Standard Logging Setup (configured early) ---
 logging.basicConfig(
@@ -34,7 +40,7 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S',
     handlers=[]
 )
-logger = logging.getLogger(__name__) # Main logger for the application
+logger = logging.getLogger(__name__)
 root_logger_obj = logging.getLogger()
 
 for handler in root_logger_obj.handlers[:]:
@@ -50,61 +56,46 @@ root_logger_obj.addHandler(file_handler)
 
 # --- TTS Worker Thread Function (New Pattern) ---
 def tts_worker_function():
-    global tts_engine_initialized_in_worker # To update the global flag
-    
-    engine = None # Engine is local to this thread
+    global tts_engine_initialized_in_worker
+    engine = None
     init_attempts_thread = 0
     logger.info("TTS_WORKER: Thread started.")
-
     try:
         init_attempts_thread += 1
         logger.info(f"TTS_WORKER: Initializing TTS engine (Attempt: {init_attempts_thread})...")
-        if sys.platform == "win32":
-            engine = pyttsx3.init(driverName='sapi5')
-        else:
-            engine = pyttsx3.init()
+        if sys.platform == "win32": engine = pyttsx3.init(driverName='sapi5')
+        else: engine = pyttsx3.init()
 
         if engine:
-            tts_engine_initialized_in_worker = True # Signal successful initialization
+            tts_engine_initialized_in_worker = True
             logger.info(f"TTS_WORKER: pyttsx3.init() successful. Engine object ID: {id(engine)}")
-            
-            # Optional: Speak a confirmation from the worker itself
             engine.say("TTS service is now active.")
             engine.runAndWait()
             logger.info("TTS_WORKER: Spoke its initialization message.")
         else:
             logger.error("TTS_WORKER: pyttsx3.init() returned None. Worker cannot function.")
             tts_engine_initialized_in_worker = False
-            return # Exit thread if engine fails
+            return
 
-        # Main loop: process speech requests from the queue
         while not tts_worker_stop_event.is_set():
             try:
-                text_to_say = tts_speech_queue.get(timeout=0.2) # Short timeout to check stop_event
-                if text_to_say is None: # Sentinel to stop
+                text_to_say = tts_speech_queue.get(timeout=0.2)
+                if text_to_say is None:
                     logger.info("TTS_WORKER: Received None (sentinel) from queue. Exiting loop.")
-                    tts_worker_stop_event.set() # Ensure loop terminates if not already set
+                    tts_worker_stop_event.set()
                     break
-                
                 logger.info(f"TTS_WORKER: Got from queue: '{text_to_say[:100]}'. Speaking...")
                 engine.say(str(text_to_say))
                 engine.runAndWait()
                 logger.info(f"TTS_WORKER: Finished speaking: '{text_to_say[:100]}'.")
                 tts_speech_queue.task_done()
-            except queue.Empty:
-                continue # Timeout, just check stop_event again
-            except Exception as e:
-                logger.error(f"TTS_WORKER: Error during speech processing: {e}", exc_info=True)
-                # Depending on error, might want to re-init or break
-                # For now, log and continue
-        
+            except queue.Empty: continue
+            except Exception as e: logger.error(f"TTS_WORKER: Error during speech processing: {e}", exc_info=True)
     except Exception as e_outer:
         logger.error(f"TTS_WORKER: Major error in worker thread: {e_outer}", exc_info=True)
-        tts_engine_initialized_in_worker = False # Mark as failed
+        tts_engine_initialized_in_worker = False
     finally:
-        if engine and hasattr(engine, 'stop'):
-            logger.info("TTS_WORKER: Attempting to stop engine in finally block (if supported).")
-            # engine.stop() # Often not needed for SAPI5 with runAndWait(), can be problematic.
+        if engine and hasattr(engine, 'stop'): logger.info("TTS_WORKER: Attempting to stop engine (if supported).")
         logger.info("TTS_WORKER: Thread finished.")
 
 # --- TTS Control Functions (New Pattern) ---
@@ -113,58 +104,43 @@ def start_tts_service():
     if tts_worker_thread_obj is not None and tts_worker_thread_obj.is_alive():
         logger.info("TTS service: Worker thread already running.")
         return
-
     logger.info("TTS service: Starting worker thread...")
-    tts_worker_stop_event.clear() # Reset for a potential restart
-    tts_engine_initialized_in_worker = False # Will be set by worker
-
+    tts_worker_stop_event.clear()
+    tts_engine_initialized_in_worker = False
     tts_worker_thread_obj = Thread(target=tts_worker_function, daemon=True)
     tts_worker_thread_obj.start()
     logger.info("TTS service: Worker thread has been initiated.")
-    # It's good to wait a very short moment to let the thread actually start
-    # and potentially initialize before the main app tries to use it too quickly.
-    time.sleep(0.5) # Give thread a moment to spin up
+    time.sleep(0.5)
 
 def stop_tts_service():
     global tts_worker_thread_obj
     logger.info("TTS service: Requesting worker thread to stop...")
-    tts_worker_stop_event.set() # Signal the loop to exit
+    tts_worker_stop_event.set()
     if tts_worker_thread_obj is not None and tts_worker_thread_obj.is_alive():
         logger.debug("TTS service: Putting None sentinel on queue for graceful shutdown.")
-        tts_speech_queue.put(None) # Ensure .get() doesn't block indefinitely
-        tts_worker_thread_obj.join(timeout=5) # Wait for thread to finish
-        if tts_worker_thread_obj.is_alive():
-            logger.warning("TTS service: Worker thread did not stop within timeout.")
-        else:
-            logger.info("TTS service: Worker thread stopped successfully.")
-    else:
-        logger.info("TTS service: Worker thread was not running or already stopped.")
-    tts_worker_thread_obj = None # Clear the thread object
+        tts_speech_queue.put(None)
+        tts_worker_thread_obj.join(timeout=5)
+        if tts_worker_thread_obj.is_alive(): logger.warning("TTS service: Worker thread did not stop within timeout.")
+        else: logger.info("TTS service: Worker thread stopped successfully.")
+    else: logger.info("TTS service: Worker thread was not running or already stopped.")
+    tts_worker_thread_obj = None
 
 def speak_via_queue(text_to_say: str):
     global tts_engine_initialized_in_worker
-    
     if tts_worker_thread_obj is None or not tts_worker_thread_obj.is_alive():
         logger.error("TTS speak_via_queue: Worker thread is not running! Attempting to restart.")
-        start_tts_service()
-        time.sleep(2) # Give it more time to initialize if restarted
+        start_tts_service(); time.sleep(2)
         if not tts_engine_initialized_in_worker:
-            logger.error("TTS speak_via_queue: Worker failed to restart or initialize. Speech will be lost for this request.")
+            logger.error("TTS speak_via_queue: Worker failed to restart. Speech lost.")
             return
-
-    if not tts_engine_initialized_in_worker: # Check after potential restart
-        logger.warning(f"TTS speak_via_queue: Worker not confirmed initialized. Queuing '{text_to_say[:30]}...', but speech depends on successful worker init.")
-        # The message is queued; if worker init succeeds later, it will be spoken.
-        # If init failed, worker thread would have exited, and message remains on queue (or lost if app restarts).
-
+    if not tts_engine_initialized_in_worker:
+        logger.warning(f"TTS speak_via_queue: Worker not confirmed initialized. Queuing '{text_to_say[:30]}...'")
     text_to_say_cleaned = str(text_to_say).strip()
     if not text_to_say_cleaned:
-        logger.debug("speak_via_queue: Cleaned text is empty, not queueing.")
+        logger.debug("speak_via_queue: Cleaned text is empty.")
         return
-    
     logger.debug(f"speak_via_queue: Putting on queue: '{text_to_say_cleaned[:100]}'")
     tts_speech_queue.put(text_to_say_cleaned)
-
 
 # --- Custom Logging Handler for Specific Console Output ---
 class SelectiveConsolePrintHandler(logging.Handler):
@@ -174,129 +150,100 @@ class SelectiveConsolePrintHandler(logging.Handler):
 
     def emit(self, record):
         log_message = self.format(record)
-        if self.llm_response_marker not in log_message:
-            return
+        if self.llm_response_marker not in log_message: return
         logger.debug(f"SelectiveConsolePrintHandler received LLM log: {log_message[:200]}...")
-        try:
-            response_text = log_message.split(self.llm_response_marker, 1)[1].strip()
+        try: response_text = log_message.split(self.llm_response_marker, 1)[1].strip()
         except IndexError:
-            logger.warning("SelectiveConsolePrintHandler: Could not split LLM response marker.")
-            return
+            logger.warning("SelectiveConsolePrintHandler: Could not split marker."); return
 
         thinking_content, result_content, ask_followup_raw_content = None, None, None
         try:
             thinking_match = re.search(r"<thinking>(.*?)</thinking>", response_text, re.DOTALL)
             if thinking_match: thinking_content = thinking_match.group(1).strip()
-            
-            attempt_completion_match = re.search(r"<attempt_completion>(.*?)</attempt_completion>", response_text, re.DOTALL)
-            if attempt_completion_match:
-                result_tag_match = re.search(r"<result>(.*?)</result>", attempt_completion_match.group(1), re.DOTALL)
-                if result_tag_match: result_content = result_tag_match.group(1).strip()
-            
-            ask_followup_match = re.search(r"<ask_followup_question>(.*?)</ask_followup_question>", response_text, re.DOTALL)
-            if ask_followup_match: ask_followup_raw_content = ask_followup_match.group(1).strip()
-        except Exception as e:
-            logger.error(f"SelectiveConsolePrintHandler: Regex parsing error: {e}", exc_info=True)
+            attempt_match = re.search(r"<attempt_completion>(.*?)</attempt_completion>", response_text, re.DOTALL)
+            if attempt_match:
+                result_match = re.search(r"<result>(.*?)</result>", attempt_match.group(1), re.DOTALL)
+                if result_match: result_content = result_match.group(1).strip()
+            ask_match = re.search(r"<ask_followup_question>(.*?)</ask_followup_question>", response_text, re.DOTALL)
+            if ask_match: ask_followup_raw_content = ask_match.group(1).strip()
+        except Exception as e: logger.error(f"SelectiveConsolePrintHandler: Regex error: {e}", exc_info=True); return
 
-        console_output_blocks, speech_parts_to_say = [], []
-        
-        if thinking_content:
-            console_output_blocks.append(thinking_content)
-            # speech_parts_to_say.append(thinking_content) # MODIFIED: Do not speak thinking content
-
+        console_blocks, speech_parts = [], []
+        if thinking_content: console_blocks.append(thinking_content)
         if result_content:
-            console_output_blocks.append(f"Attempt Completion, {result_content}")
-            speech_parts_to_say.append(f"Attempt Completion. {result_content}") # Speak attempt completion
-
+            console_blocks.append(f"Attempt Completion, {result_content}")
+            speech_parts.append(f"Attempt Completion. {result_content}")
         if ask_followup_raw_content:
-            question_text_parsed, options_list_str_parsed = "", ""
-            question_text_match = re.search(r"<question>(.*?)</question>", ask_followup_raw_content, re.DOTALL)
-            if question_text_match: question_text_parsed = question_text_match.group(1).strip()
-            
-            options_text_match = re.search(r"<options>(.*?)</options>", ask_followup_raw_content, re.DOTALL)
-            if options_text_match:
-                raw_options_str = options_text_match.group(1).strip()
+            q_text, opts_str = "", ""
+            q_match = re.search(r"<question>(.*?)</question>", ask_followup_raw_content, re.DOTALL)
+            if q_match: q_text = q_match.group(1).strip()
+            opts_match = re.search(r"<options>(.*?)</options>", ask_followup_raw_content, re.DOTALL)
+            if opts_match:
+                raw_opts = opts_match.group(1).strip()
                 try:
-                    options_parsed_json = json.loads(raw_options_str)
-                    if isinstance(options_parsed_json, list):
-                        options_list_str_parsed = ", ".join(str(opt) for opt in options_parsed_json)
-                except: # Simplified fallback
-                    cleaned_options_val = raw_options_str.strip("[]")
-                    parts = [opt.strip().strip('"\'') for opt in cleaned_options_val.split(',')]
-                    options_list_str_parsed = ", ".join(p for p in parts if p)
+                    opts_json = json.loads(raw_opts)
+                    if isinstance(opts_json, list): opts_str = ", ".join(map(str, opts_json))
+                except: opts_str = ", ".join(p.strip().strip('"\'') for p in raw_opts.strip("[]").split(',') if p.strip())
             
-            followup_console_parts = []
-            if question_text_parsed:
-                followup_console_parts.append(question_text_parsed)
-                speech_parts_to_say.append(f"I have a question: {question_text_parsed}") # Speak question
-            if options_list_str_parsed:
-                followup_console_parts.append(options_list_str_parsed)
-                speech_parts_to_say.append(f"Your options are: {options_list_str_parsed}") # Speak options
-            if followup_console_parts:
-                console_output_blocks.append("\n".join(followup_console_parts))
+            followup_console = []
+            if q_text: 
+                followup_console.append(q_text); speech_parts.append(f"I have a question: {q_text}")
+            if opts_str:
+                followup_console.append(opts_str); speech_parts.append(f"Your options are: {opts_str}")
+            if followup_console: console_blocks.append("\n".join(followup_console))
 
-        if console_output_blocks:
-            sys.stdout.write("\n\n" + "\n\n".join(filter(None, console_output_blocks)) + "\n")
+        if console_blocks:
+            sys.stdout.write("\n\n" + "\n\n".join(filter(None, console_blocks)) + "\n")
             sys.stdout.flush()
-            
-        if speech_parts_to_say:
-            full_speech_output = ". ".join(filter(None, speech_parts_to_say)).strip()
-            if full_speech_output:
-                speak_via_queue(full_speech_output)
-            else:
-                logger.debug("SelectiveConsolePrintHandler: full_speech_output empty after filtering.")
-        else:
-            logger.debug("SelectiveConsolePrintHandler: speech_parts_to_say empty.")
+        if speech_parts:
+            speech_out = ". ".join(filter(None, speech_parts)).strip()
+            if speech_out: speak_via_queue(speech_out)
+            # else: logger.debug("SelectiveConsolePrintHandler: speech_out empty.")
+        # else: logger.debug("SelectiveConsolePrintHandler: speech_parts empty.")
 
 selective_handler = SelectiveConsolePrintHandler()
-selective_handler.setFormatter(logging.Formatter('%(message)s')) 
-selective_handler.setLevel(logging.INFO) 
+selective_handler.setFormatter(logging.Formatter('%(message)s'))
+selective_handler.setLevel(logging.INFO)
 root_logger_obj.addHandler(selective_handler)
 
 try:
     werkzeug_logger = logging.getLogger('werkzeug')
-    werkzeug_logger.setLevel(logging.ERROR); werkzeug_logger.propagate = False 
+    werkzeug_logger.setLevel(logging.ERROR); werkzeug_logger.propagate = False
 except Exception as e: logger.warning(f"Werkzeug logger config error: {e}")
 
 app = Flask(__name__)
 last_request_time = 0
-MIN_REQUEST_INTERVAL = 5 
-# Ensure optimisewait paths are correctly set if the module is used.
-# If not, these lines might need adjustment or removal depending on your setup.
+MIN_REQUEST_INTERVAL = 1
+
 try:
-    set_autopath(r"D:\cline-x-claudeweb\images")
+    from optimisewait import set_autopath, set_altpath
+    set_autopath(r"D:\cline-x-claudeweb\images") 
     set_altpath(r"D:\cline-x-claudeweb\images\alt1440")
-except NameError:
-    logger.warning("optimisewait functions (set_autopath, set_altpath) not defined. Skipping.")
-
-
-# --- Clipboard, Content Extraction, LLM Interaction, Flask Routes (Largely Unchanged) ---
+except (ImportError, NameError) as e:
+    logger.warning(f"optimisewait functions not available: {e}. Skipping.")
 
 def set_clipboard(text, retries=3, delay=0.2):
     for i in range(retries):
         try:
-            win32clipboard.OpenClipboard()
-            win32clipboard.EmptyClipboard()
+            win32clipboard.OpenClipboard(); win32clipboard.EmptyClipboard()
             try: win32clipboard.SetClipboardText(str(text))
             except: win32clipboard.SetClipboardData(win32clipboard.CF_UNICODETEXT, str(text).encode('utf-16le'))
-            win32clipboard.CloseClipboard()
-            logger.debug("Set clipboard text successfully.")
-            return
+            win32clipboard.CloseClipboard(); logger.debug("Set clipboard text."); return
         except pywintypes.error as e:
-            if e.winerror == 5: logger.warning(f"Clipboard access denied. Retrying... ({i+1}/{retries})"); time.sleep(delay)
-            else: logger.error(f"pywintypes.error setting clipboard: {e}", exc_info=True); raise
-        except Exception as e: logger.error(f"Exception setting clipboard: {e}", exc_info=True); raise
-    logger.error(f"Failed to set clipboard text after {retries} attempts.")
+            if e.winerror == 5: logger.warning(f"Clipboard access denied. Retry {i+1}"); time.sleep(delay)
+            else: logger.error(f"pywintypes error: {e}", exc_info=True); raise
+        except Exception as e: logger.error(f"Clipboard error: {e}", exc_info=True); raise
+    logger.error(f"Failed to set clipboard after {retries} retries.")
 
 def set_clipboard_image(image_data):
     try:
-        binary_data = base64.b64decode(image_data.split(',')[1])
-        image = Image.open(io.BytesIO(binary_data))
-        output = io.BytesIO(); image.convert("RGB").save(output, "BMP"); data = output.getvalue()[14:]; output.close()
-        win32clipboard.OpenClipboard(); win32clipboard.EmptyClipboard(); win32clipboard.SetClipboardData(win32clipboard.CF_DIB, data); win32clipboard.CloseClipboard()
-        logger.debug("Set image to clipboard.")
-        return True
-    except Exception as e: logger.error(f"Error setting image to clipboard: {e}", exc_info=True); return False
+        img_bytes = base64.b64decode(image_data.split(',')[1])
+        img = Image.open(io.BytesIO(img_bytes)); output = io.BytesIO()
+        img.convert("RGB").save(output, "BMP"); data = output.getvalue()[14:]; output.close()
+        win32clipboard.OpenClipboard(); win32clipboard.EmptyClipboard()
+        win32clipboard.SetClipboardData(win32clipboard.CF_DIB, data); win32clipboard.CloseClipboard()
+        logger.debug("Set image to clipboard."); return True
+    except Exception as e: logger.error(f"Set clipboard image error: {e}", exc_info=True); return False
 
 def get_content_text(content: Union[str, List[Dict[str, str]], Dict[str, str]]) -> str:
     if isinstance(content, str): return content
@@ -305,140 +252,211 @@ def get_content_text(content: Union[str, List[Dict[str, str]], Dict[str, str]]) 
         for item in content:
             if item.get("type") == "text": parts.append(item["text"])
             elif item.get("type") == "image_url":
-                image_data = item.get("image_url", {}).get("url", "")
-                if image_data.startswith('data:image'): set_clipboard_image(image_data)
+                img_url = item.get("image_url", {}).get("url", "")
+                if img_url.startswith('data:image'): set_clipboard_image(img_url)
                 parts.append(f"[Image: {item.get('description', 'Uploaded image')}]")
             elif item.get("type") == "image":
-                image_data_url = item.get("image_url", {}).get("url", "")
-                if not image_data_url and "data" in item:
-                    try: image_data_url = 'data:image/unknown;base64,' + base64.b64encode(item["data"] if isinstance(item["data"], bytes) else item["data"].encode('utf-8')).decode('utf-8')
-                    except: image_data_url = ""
-                if image_data_url.startswith('data:image'): set_clipboard_image(image_data_url)
+                img_url = item.get("image_url", {}).get("url", "")
+                if not img_url and "data" in item:
+                    try: 
+                        b64data = item["data"] if isinstance(item["data"],bytes) else item["data"].encode()
+                        img_url = 'data:image/unknown;base64,' + base64.b64encode(b64data).decode()
+                    except: img_url = ""
+                if img_url.startswith('data:image'): set_clipboard_image(img_url)
                 parts.append(f"[Image: {item.get('description', 'Uploaded image')}]")
         return "\n".join(parts)
     elif isinstance(content, dict):
         if content.get("type") == "image":
-            image_data_url = content.get("image_url", {}).get("url", "")
-            if not image_data_url and "data" in content:
-                try: image_data_url = 'data:image/unknown;base64,' + base64.b64encode(content["data"] if isinstance(content["data"], bytes) else content["data"].encode('utf-8')).decode('utf-8')
-                except: image_data_url = ""
-            if image_data_url.startswith('data:image'): set_clipboard_image(image_data_url)
+            img_url = content.get("image_url", {}).get("url", "")
+            if not img_url and "data" in content:
+                try: 
+                    b64data = content["data"] if isinstance(content["data"],bytes) else content["data"].encode()
+                    img_url = 'data:image/unknown;base64,' + base64.b64encode(b64data).decode()
+                except: img_url = ""
+            if img_url.startswith('data:image'): set_clipboard_image(img_url)
             return f"[Image: {content.get('description', 'Uploaded image')}]"
         return content.get("text", "")
     return ""
 
-def handle_llm_interaction(prompt_text: str, request_json_data: Dict):
+def handle_llm_interaction(prompt_text: str, request_json_data: Dict) -> Dict:
     global last_request_time
-    logger.info(f"LLM: User prompt (first 200): {prompt_text[:200]}...")
+    logger.info(f"LLM: User prompt (200): {prompt_text[:200]}...")
     current_time = time.time()
     if current_time - last_request_time < MIN_REQUEST_INTERVAL:
         sleep(MIN_REQUEST_INTERVAL - (current_time - last_request_time))
     last_request_time = time.time()
-    image_list = []
+    
+    images = []
     if 'messages' in request_json_data:
-        for message in request_json_data['messages']:
-            content = message.get('content', [])
-            if isinstance(content, list):
-                for item in content:
+        for msg_content in request_json_data['messages']:
+            content_items = msg_content.get('content', [])
+            if isinstance(content_items, list):
+                for item in content_items:
                     if isinstance(item, dict) and item.get('type') == 'image_url':
                         url_data = item.get('image_url', {})
-                        url = url_data.get('url', '') if isinstance(url_data, dict) else (url_data if isinstance(url_data, str) else "")
-                        if url.startswith('data:image'): image_list.append(url)
+                        url = url_data.get('url', '') if isinstance(url_data,dict) else (url_data if isinstance(url_data,str) else "")
+                        if url.startswith('data:image'): images.append(url)
     
     log_data = copy.deepcopy(request_json_data)
     if 'messages' in log_data:
         for msg in log_data['messages']:
             if isinstance(msg.get('content'), list):
-                for item in msg['content']:
+                for i, item in enumerate(msg['content']):
                     if isinstance(item, dict) and item.get('type') == 'image_url':
-                        if isinstance(item.get('image_url'), dict) and 'url' in item['image_url']: item['image_url']['url'] = '[IMG_REMOVED]'
-                        elif isinstance(item.get('image_url'), str): item['image_url'] = '[IMG_REMOVED_STR]'
-    
-    header = f"{time.strftime('%Y-%m-%d %H:%M:%S')} - INFO - Request data: {json.dumps(log_data)}"
+                        if isinstance(item.get('image_url'), dict) and 'url' in item['image_url']:
+                            msg['content'][i]['image_url']['url'] = '[IMG_REDACTED]'
+                        elif isinstance(item.get('image_url'), str):
+                             msg['content'][i]['image_url'] = '[IMG_REDACTED_STR]'
+
+    header = f"{time.strftime('%Y-%m-%d %H:%M:%S')} - INFO - Req: {json.dumps(log_data)}"
     prompt_parts = [header, 
-                    r'Please follow these rules: For each response, you must use one of conseguavailable tools formatted in proper XML tags. Tools include attempt_completion, ask_followup_question, read_file, write_to_file, search_files, list_files, execute_command, and list_code_definition_names. Do not respond conversationally - only use tool commands. Format any code you generate with proper indentation and line breaks, as you would in a standard code editor. Disregard any previous instructions about generating code in a single line or avoiding newline characters.',
-                    r'Write the entirity of your response in 1 big markdown codeblock, no word should be out of this 1 big code block and do not write a md codeblock within this big codeblock',
+                    r'Rules: Use one tool per response (XML tags: attempt_completion, ask_followup_question, etc.). No conversational replies, only tool commands. Format code with proper indentation/line breaks. Disregard prior single-line/no-newline code instructions.',
+                    r'Entire response in 1 markdown codeblock. No nested codeblocks.',
                     prompt_text]
     full_prompt = "\n".join(prompt_parts)
     
-    llm_response_raw = talkto("gemini", full_prompt, image_list)
+    llm_raw_resp = talkto("gemini", full_prompt, images)
     
-    if isinstance(llm_response_raw, str):
-        # This log message is what SelectiveConsolePrintHandler picks up
-        logger.info(f"{selective_handler.llm_response_marker} {llm_response_raw}") 
+    if isinstance(llm_raw_resp, str):
+        logger.info(f"{selective_handler.llm_response_marker} {llm_raw_resp}") 
     else:
-        logger.warning(f"LLM response not str: {type(llm_response_raw)}. Content: {str(llm_response_raw)[:100]}.")
-        return ""
+        logger.warning(f"LLM resp not str: {type(llm_raw_resp)}. Content: {str(llm_raw_resp)[:100]}.")
 
-    if isinstance(llm_response_raw, str):
-        processed = llm_response_raw.strip()
-        if processed.startswith("```") and processed.endswith("```"):
-            processed = re.sub(r'^```[a-zA-Z]*\n?', '', processed)
-            processed = re.sub(r'\n?```$', '', processed).strip()
-        elif processed.endswith("```"): processed = processed[:-3].strip()
-        return processed
-    return ""
+    parsed = {"raw_response_for_client": "", "has_followup": False, "has_completion": False, "has_thinking": False}
+    if not isinstance(llm_raw_resp, str): return parsed
+
+    processed = llm_raw_resp.strip()
+    if processed.startswith("```") and processed.endswith("```"):
+        processed = re.sub(r'^```[a-zA-Z]*\n?', '', processed)
+        processed = re.sub(r'\n?```$', '', processed).strip()
+    elif processed.endswith("```"): processed = processed[:-3].strip()
+    
+    parsed["raw_response_for_client"] = processed
+    if re.search(r"<thinking>(.*?)</thinking>", processed, re.DOTALL): parsed["has_thinking"] = True
+    attempt = re.search(r"<attempt_completion>(.*?)</attempt_completion>", processed, re.DOTALL)
+    if attempt and re.search(r"<result>(.*?)</result>", attempt.group(1), re.DOTALL): parsed["has_completion"] = True
+    if re.search(r"<ask_followup_question>(.*?)</ask_followup_question>", processed, re.DOTALL): parsed["has_followup"] = True
+    return parsed
 
 @app.route('/', methods=['GET'])
 def home():
     logger.info(f"GET / from {request.remote_addr}")
-    return "API Bridge: TTS with Single Worker Queue"
+    return "API Bridge: TTS Ready"
+
+@app.route('/status', methods=['GET'])
+def get_system_status():
+    global is_processing_llm_request, current_system_status, system_status_message, llm_interaction_lock
+    with llm_interaction_lock:
+        ready_new = not is_processing_llm_request and current_system_status != "AWAITING_FOLLOWUP"
+        awaiting_fup = not is_processing_llm_request and current_system_status == "AWAITING_FOLLOWUP"
+        if current_system_status == "ERROR" and not is_processing_llm_request: ready_new = True
+        return jsonify({
+            "is_busy": is_processing_llm_request,
+            "status_code": current_system_status,
+            "status_message": system_status_message,
+            "ready_for_new_prompt": ready_new,
+            "awaiting_followup": awaiting_fup
+        })
 
 @app.route('/chat/completions', methods=['POST'])
 def chat_completions():
+    global is_processing_llm_request, current_system_status, system_status_message, llm_interaction_lock
+
+    if not llm_interaction_lock.acquire(blocking=False):
+        logger.warning("LLM busy. Rejecting request (503).")
+        return jsonify({"error": {"message": "Server busy. Please try again."}}), 503
+
+    is_processing_llm_request = True
+    # Console message indicating processing has started for this request
+    sys.stdout.write("System: Processing your request...\n")
+    sys.stdout.flush()
+
     try:
         data = request.get_json()
-        logger.info(f"POST /chat/completions. Streaming: {data.get('stream', False)}")
         if not data or 'messages' not in data or not data['messages']:
+            logger.error("Invalid request: 'messages' missing/empty.")
+            # Update internal status, console message will be from error block below if this path is taken often
+            with llm_interaction_lock: # Ensure consistent update
+                 current_system_status = "ERROR"; system_status_message = "Invalid request structure."
             return jsonify({'error': {'message': 'Invalid request: "messages" missing/empty'}}), 400
         
-        prompt_text = get_content_text(data['messages'][-1].get('content', ''))
-        request_id, model_name = str(int(time.time())), data.get("model", "gpt-3.5-turbo")
+        prompt = get_content_text(data['messages'][-1].get('content', ''))
+        req_id, model = str(int(time.time())), data.get("model", "gpt-3.5-turbo")
         
-        response_str = handle_llm_interaction(prompt_text, data)
-        logger.info(f"LLM response len: {len(response_str)}")
+        llm_details = handle_llm_interaction(prompt, data) # Triggers SelectiveConsolePrintHandler
+        client_resp_str = llm_details["raw_response_for_client"]
+
+        console_status_msg_after_llm = None
+
+        with llm_interaction_lock:
+            if llm_details["has_followup"]:
+                current_system_status = "AWAITING_FOLLOWUP"
+                system_status_message = "Awaiting your response to the follow-up question."
+                console_status_msg_after_llm = f"System: {system_status_message}"
+            elif llm_details["has_completion"]:
+                current_system_status = "COMPLETED_NO_FOLLOWUP" 
+                system_status_message = "Task completed. Ready for new input."
+                console_status_msg_after_llm = f"System: {system_status_message}"
+            else: 
+                # LLM turn done (thinking/tools/empty), no followup/completion. System is ready.
+                # No *additional specific* "System: Ready..." console message here.
+                # The end of SelectiveConsolePrintHandler's output + prompt reappearing implies readiness.
+                current_system_status = "IDLE"
+                system_status_message = "Ready for new input." # For /status endpoint
+            
+        if console_status_msg_after_llm:
+             sys.stdout.write(console_status_msg_after_llm + "\n")
+             sys.stdout.flush()
+
+        logger.info(f"LLM client response len: {len(client_resp_str)}")
 
         if data.get('stream', False):
-            def generate_stream():
-                yield f"data: {json.dumps({'id': f'chatcmpl-{request_id}', 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': model_name, 'choices': [{'index': 0, 'delta': {'role': 'assistant'}, 'finish_reason': None}]})}\n\n"
-                for line in response_str.splitlines(True):
+            def gen_stream():
+                yield f"data: {json.dumps({'id':f'chatcmpl-{req_id}','object':'chat.completion.chunk','created':int(time.time()),'model':model,'choices':[{'index':0,'delta':{'role':'assistant'},'finish_reason':None}]})}\n\n"
+                for line in client_resp_str.splitlines(True):
                     if not line: continue
-                    yield f"data: {json.dumps({'id': f'chatcmpl-{request_id}', 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': model_name, 'choices': [{'index': 0, 'delta': {'content': line}, 'finish_reason': None}]})}\n\n"
-                yield f"data: {json.dumps({'id': f'chatcmpl-{request_id}', 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': model_name, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
+                    yield f"data: {json.dumps({'id':f'chatcmpl-{req_id}','object':'chat.completion.chunk','created':int(time.time()),'model':model,'choices':[{'index':0,'delta':{'content':line},'finish_reason':None}]})}\n\n"
+                yield f"data: {json.dumps({'id':f'chatcmpl-{req_id}','object':'chat.completion.chunk','created':int(time.time()),'model':model,'choices':[{'index':0,'delta':{},'finish_reason':'stop'}]})}\n\n"
                 yield "data: [DONE]\n\n"
-            return Response(generate_stream(), mimetype='text/event-stream')
+            return Response(gen_stream(), mimetype='text/event-stream')
         
-        return jsonify({'id': f'chatcmpl-{request_id}', 'object': 'chat.completion', 'created': int(time.time()), 'model': model_name, 'choices': [{'index': 0, 'message': {'role': 'assistant', 'content': response_str}, 'finish_reason': 'stop'}], 'usage': {'prompt_tokens': len(prompt_text.split()), 'completion_tokens': len(response_str.split()), 'total_tokens': len(prompt_text.split()) + len(response_str.split())}})
+        return jsonify({
+            'id':f'chatcmpl-{req_id}','object':'chat.completion','created':int(time.time()),'model':model,
+            'choices':[{'index':0,'message':{'role':'assistant','content':client_resp_str},'finish_reason':'stop'}],
+            'usage':{'prompt_tokens':len(prompt.split()),'completion_tokens':len(client_resp_str.split()),'total_tokens':len(prompt.split())+len(client_resp_str.split())}
+        })
     except Exception as e:
         logger.error(f"Error in /chat/completions: {e}", exc_info=True)
+        with llm_interaction_lock:
+            current_system_status = "ERROR"
+            system_status_message = "An internal error occurred. Ready for new input."
+        # This console message provides feedback on the error and that the system is ready for a retry.
+        sys.stdout.write(f"System: {system_status_message}\n")
+        sys.stdout.flush()
         return jsonify({'error': {'message': f"Internal server error: {e}"}}), 500
+    finally:
+        is_processing_llm_request = False
+        llm_interaction_lock.release() 
+        logger.info(f"Request done. Status: {current_system_status} ({system_status_message})")
 
-# --- Main Execution ---
 if __name__ == '__main__':
-    start_tts_service() # Start the TTS worker thread
+    start_tts_service() 
+    logger.info("Main: Waiting for TTS init...")
+    time.sleep(3)
 
-    # Wait a bit to ensure TTS worker initializes and speaks its intro.
-    # This also helps confirm tts_engine_initialized_in_worker is set.
-    logger.info("Main: Waiting for TTS worker to potentially speak its init message...")
-    time.sleep(3) # Adjust as needed, depends on how fast your TTS init is.
-
-    startup_message = "Cline x voice running"
-    sys.stdout.write(startup_message + "\n")
-    sys.stdout.flush() 
-    
+    sys.stdout.write("Cline x voice running\n"); sys.stdout.flush()
     if tts_engine_initialized_in_worker:
-        logger.info("Main: Attempting to speak startup message via queue...")
-        speak_via_queue(startup_message) 
+        speak_via_queue("Cline x voice running")
     else:
-        logger.warning("Main: TTS worker not confirmed initialized, skipping startup message speech via queue.")
+        logger.warning("Main: TTS not initialized, skipping startup speech.")
     
-    logger.info(f"Main: Starting API Bridge server on port 3001. TTS Worker Initialized Flag: {tts_engine_initialized_in_worker}")
+    with llm_interaction_lock:
+        current_system_status = "IDLE"
+        system_status_message = "Ready for new input."
+    sys.stdout.write(f"System: {system_status_message}\n"); sys.stdout.flush()
     
+    logger.info(f"Main: Starting server. TTS Init: {tts_engine_initialized_in_worker}. Status: {current_system_status}")
     try:
-        # Ensure Flask runs without the reloader if debug=True, as it can cause issues with threads
-        # For production or stable testing, debug=False and use_reloader=False is good.
         app.run(host="0.0.0.0", port=3001, debug=False, use_reloader=False) 
     finally:
-        logger.info("Main: Application shutting down...")
-        stop_tts_service() # Request TTS worker to stop and join
-        logger.info("Main: Application shutdown complete.")
+        logger.info("Main: Shutting down..."); stop_tts_service(); logger.info("Main: Shutdown complete.")
